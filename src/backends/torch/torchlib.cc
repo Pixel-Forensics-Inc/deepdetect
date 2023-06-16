@@ -1371,6 +1371,9 @@ namespace dd
   int TorchLib<TInputConnectorStrategy, TOutputConnectorStrategy,
                TMLModel>::predict(const APIData &ad_in, APIData &out)
   {
+    // concurrent calls can use more memory on gpu than initially expected
+    std::lock_guard<std::mutex> lock(_net_mutex);
+
     oatpp::Object<DTO::ServicePredict> predict_dto;
 
     // XXX: until everything is DTO, we consider the two cases:

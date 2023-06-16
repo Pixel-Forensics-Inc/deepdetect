@@ -115,6 +115,11 @@ namespace dd
     double _reg_weight
         = 1; /**< for detection models, weight for bbox regression loss. */
 
+    std::mutex
+        _net_mutex; /**< mutex around net, e.g. no concurrent predict calls as
+                         it can use more gpu memory than initially expected.
+                         Use batches instead. */
+
     APIData _template_params; /**< template parameters, for recurrent and
                                  native models*/
 
