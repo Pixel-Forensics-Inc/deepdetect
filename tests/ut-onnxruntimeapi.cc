@@ -19,6 +19,7 @@
  */
 
 #include "deepdetect.h"
+#include "backends/onnxruntime/onnxruntimeinputconns.h"
 #include "jsonapi.h"
 #include <gtest/gtest.h>
 #include <fstream>
@@ -39,6 +40,30 @@ static std::string resnet_onnx_repo = "../examples/trt/resnet_onnx_trt/";
 static std::string yolox_onnx_repo = "../examples/trt/yolox_onnx_trt_nowrap/";
 static std::string cyclegan_onnx_repo
     = "../examples/trt/cyclegan_resnet_attn_onnx_trt/";
+
+TEST(onnxruntimeapi, pack_transformed_image_layout)
+{
+  ImgONNXRuntimeInputFileConn input;
+  input._bw = true;
+  input._images.emplace_back(2, 3, CV_8UC4, cv::Scalar(1, 2, 3, 4));
+  input._images.emplace_back(2, 3, CV_8UC4, cv::Scalar(5, 6, 7, 8));
+  const auto shape = input.batch_shape(2);
+  ASSERT_EQ((std::array<int, 3>{ 4, 2, 3 }), shape);
+  input.process_batch(2, 2 * shape[0] * shape[1] * shape[2], nullptr);
+  ASSERT_EQ(input._buf.size(), 48u);
+  for (size_t i = 0; i < input._buf.size(); ++i)
+    EXPECT_EQ(input._buf[i], 1 + i / 6);
+}
+
+TEST(onnxruntimeapi, reject_mixed_transformed_layouts)
+{
+  ImgONNXRuntimeInputFileConn input;
+  input._images.emplace_back(2, 3, CV_8UC3);
+  input._images.emplace_back(2, 3, CV_8UC4);
+  EXPECT_THROW(input.batch_shape(2), InputConnectorBadParamException);
+  input._images[1] = cv::Mat(3, 2, CV_8UC3);
+  EXPECT_THROW(input.batch_shape(2), InputConnectorBadParamException);
+}
 
 TEST(onnxruntimeapi, service_predict_classification)
 {
