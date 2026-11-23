@@ -23,6 +23,7 @@
 #define ONNXRUNTIMEINPUTCONNS_H
 
 #include "imginputfileconn.h"
+#include <array>
 
 namespace dd
 {
@@ -43,7 +44,6 @@ namespace dd
 
     bool _has_mean_file = false;
     std::vector<float> _buf;
-    float *_cuda_buf = nullptr;
 
     float *data()
     {
@@ -68,11 +68,6 @@ namespace dd
     {
     }
 
-    int channels() const
-    {
-      return this->_bw ? 1 : 3;
-    }
-
     int width() const
     {
       return _width;
@@ -90,7 +85,8 @@ namespace dd
 
     void transform(oatpp::Object<DTO::ServicePredict> input_dto);
 
-    int process_batch(const unsigned int batch_size);
+    std::array<int, 3> batch_shape(int batch_size) const;
+    void process_batch(int batch_size, size_t elements, float *device_buffer);
 
     std::string _meanfname = "mean.binaryproto";
     std::string _correspname = "corresp.txt";
@@ -104,7 +100,7 @@ namespace dd
     void CVMatToORTBuffer(cv::Mat &img, int i);
 
 #ifdef USE_CUDA_CV
-    void GpuMatToORTBuffer(cv::cuda::GpuMat &img, int i);
+    void GpuMatToORTBuffer(cv::cuda::GpuMat &img, int i, float *device_buffer);
 #endif
   };
 }

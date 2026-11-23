@@ -25,6 +25,7 @@
 #include "utils/bbox.hpp"
 #include "../tensorrt/models/yolo.hpp"
 #include <algorithm>
+#include <limits>
 
 #if !defined(APPLE) && !defined(USE_ONNXRUNTIME_CPU_ONLY)
 #include <cuda_runtime_api.h>
@@ -68,8 +69,6 @@ namespace dd
   {
     this->_libname = "onnxruntime";
     this->_nclasses = other._nclasses;
-    this->_width = other._width;
-    this->_height = other._height;
     this->_max_batch_size = other._max_batch_size;
     this->_gpuid = other._gpuid;
     this->_gpu = other._gpu;
@@ -516,16 +515,7 @@ namespace dd
           {
             Ort::TypeInfo type_info = _session->GetInputTypeInfo(i);
             auto tensor_info = type_info.GetTensorTypeAndShapeInfo();
-            std::vector<int64_t> input_dims = tensor_info.GetShape();
-
-            if (input_dims.size() == 4)
-              {
-                if (this->_height <= 0 && input_dims[2] > 0)
-                  this->_height = input_dims[2];
-
-                if (this->_width <= 0 && input_dims[3] > 0)
-                  this->_width = input_dims[3];
-              }
+            _input_dims = tensor_info.GetShape();
           }
       }
     for (const auto &name : _input_node_names)
@@ -632,6 +622,7 @@ namespace dd
       cudaStream_t stream = nullptr;
       bool has_stream = false;
       void *buf = nullptr;
+      size_t capacity = 0;
 
       ~CudaPredictGuard()
       {
@@ -650,9 +641,6 @@ namespace dd
 
     TInputConnectorStrategy inputc(this->_inputc);
 
-    int target_width = this->_width;
-    int target_height = this->_height;
-
 #if !defined(APPLE) && !defined(USE_ONNXRUNTIME_CPU_ONLY)
     if (this->_gpu)
       {
@@ -664,46 +652,6 @@ namespace dd
               "ONNX Runtime: Failed to create CUDA stream");
         cuda_guard.has_stream = true;
 #ifdef USE_CUDA_CV
-        if (target_width <= 0)
-          {
-            if (predict_dto->parameters->input
-                && predict_dto->parameters->input->width
-                && predict_dto->parameters->input->width > 0)
-              {
-                target_width = predict_dto->parameters->input->width;
-              }
-            else
-              {
-                target_width = inputc.width();
-              }
-          }
-        if (target_height <= 0)
-          {
-            if (predict_dto->parameters->input
-                && predict_dto->parameters->input->height
-                && predict_dto->parameters->input->height > 0)
-              {
-                target_height = predict_dto->parameters->input->height;
-              }
-            else
-              {
-                target_height = inputc.height();
-              }
-          }
-        if (target_width <= 0 || target_height <= 0)
-          throw MLLibBadParamException(
-              "Input width and height must be specified for dynamic ONNX "
-              "models when USE_CUDA_CV is enabled");
-        // Dynamically allocate to ensure memory safety if concurrent_predict
-        // is true
-        if (cudaMalloc(&cuda_guard.buf, this->_max_batch_size
-                                            * inputc.channels() * target_height
-                                            * target_width * sizeof(float))
-            != cudaSuccess)
-          throw MLLibInternalException(
-              "ONNX Runtime: Failed to allocate CUDA input buffer");
-        inputc._cuda_buf = static_cast<float *>(cuda_guard.buf);
-        // Dynamically initialize only when a GPU is active
         cv_stream = std::make_unique<cv::cuda::Stream>(
             cv::cuda::StreamAccessor::wrapStream(cuda_guard.stream));
         inputc._cuda_stream = cv_stream.get();
@@ -716,40 +664,53 @@ namespace dd
     this->_stats.transform_end();
     this->_stats.inc_inference_count(inputc._batch_size);
 
-    // Enforce fixed model dimensions only when the ONNX graph itself is static
-    if ((this->_width > 0 && inputc.width() != this->_width)
-        || (this->_height > 0 && inputc.height() != this->_height))
-      {
-        throw MLLibBadParamException(
-            "Model height and/or width differ from the input data size. "
-            "Input data size should be "
-            + std::to_string(this->_width) + "x"
-            + std::to_string(this->_height));
-      }
-
-    // Sync with actual post-transform dimensions (handles unresized CPU
-    // inputs)
-    if (this->_width <= 0)
-      target_width = inputc.width();
-    if (this->_height <= 0)
-      target_height = inputc.height();
-    if (target_width <= 0 || target_height <= 0)
-      {
-        throw MLLibBadParamException(
-            "Input data width and height must be > 0 for dynamic ONNX models");
-      }
-
     int idoffset = 0;
-    int batch_size = 0;
-    while ((batch_size = inputc.process_batch(this->_max_batch_size)) > 0)
+    while (idoffset < inputc._batch_size)
       {
+        int batch_size
+            = std::min(this->_max_batch_size, inputc._batch_size - idoffset);
+        if (batch_size <= 0)
+          throw MLLibBadParamException("Maximum batch size must be positive");
+        const auto shape = inputc.batch_shape(batch_size);
+        const int target_height = shape[1];
+        const int target_width = shape[2];
+        if (_input_dims.size() != 4)
+          throw MLLibBadParamException(
+              "ONNX image input must have NCHW layout");
+        size_t input_tensor_size = batch_size;
+        for (size_t i = 0; i < shape.size(); ++i)
+          {
+            if (_input_dims[i + 1] > 0 && _input_dims[i + 1] != shape[i])
+              throw MLLibBadParamException(
+                  "Transformed image dimensions differ from ONNX model input");
+            if (input_tensor_size > std::numeric_limits<size_t>::max()
+                                        / sizeof(float) / shape[i])
+              throw MLLibBadParamException("ONNX input tensor is too large");
+            input_tensor_size *= shape[i];
+          }
         std::vector<int64_t> input_shape
-            = { static_cast<int64_t>(batch_size),
-                static_cast<int64_t>(inputc.channels()),
-                static_cast<int64_t>(target_height),
-                static_cast<int64_t>(target_width) };
-        size_t input_tensor_size
-            = batch_size * inputc.channels() * target_height * target_width;
+            = { batch_size, shape[0], target_height, target_width };
+        float *device_buffer = nullptr;
+#if defined(USE_CUDA_CV) && !defined(APPLE)                                   \
+    && !defined(USE_ONNXRUNTIME_CPU_ONLY)
+        if (this->_gpu && inputc._cuda)
+          {
+            if (input_tensor_size > cuda_guard.capacity)
+              {
+                if (cuda_guard.buf)
+                  cudaFree(cuda_guard.buf);
+                cuda_guard.buf = nullptr;
+                if (cudaMalloc(&cuda_guard.buf,
+                               input_tensor_size * sizeof(float))
+                    != cudaSuccess)
+                  throw MLLibInternalException(
+                      "ONNX Runtime: Failed to allocate CUDA input buffer");
+                cuda_guard.capacity = input_tensor_size;
+              }
+            device_buffer = static_cast<float *>(cuda_guard.buf);
+          }
+#endif
+        inputc.process_batch(batch_size, input_tensor_size, device_buffer);
 
         Ort::Value input_tensor{ nullptr };
 
@@ -849,6 +810,24 @@ namespace dd
                 "ONNX Runtime returned no output tensors");
           }
 
+        const size_t parsed_outputs
+            = extract_layer.empty() ? 1 : output_tensors.size();
+        for (size_t t = 0; t < parsed_outputs; ++t)
+          {
+            if (!output_tensors[t].IsTensor())
+              throw MLLibBadParamException("Expected an ONNX tensor output");
+            auto info = output_tensors[t].GetTensorTypeAndShapeInfo();
+            auto dims = info.GetShape();
+            if (dims.empty() || dims.front() != batch_size)
+              throw MLLibBadParamException(
+                  "ONNX output batch dimension must match the input batch");
+            if (extract_layer.empty()
+                && info.GetElementType()
+                       != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
+              throw MLLibBadParamException(
+                  "ONNX classification and detection outputs must be float32");
+          }
+
         // Handle extract_layer tensor extraction
         if (!extract_layer.empty())
           {
@@ -935,7 +914,7 @@ namespace dd
 
             std::vector<float> yolo_out;
             const float *yolo_ptr = nullptr;
-            int max_dets = 0;
+            size_t max_dets = 0;
 
             if (this->_template == "yolox")
               {
@@ -955,9 +934,8 @@ namespace dd
                     std::vector<float> raw_out(
                         out_data, out_data + tensor_info.GetElementCount());
                     yolo_out = yolo_utils::parse_yolo_output(
-                        raw_out, batch_size, static_cast<int>(out_shape[1]),
-                        static_cast<int>(out_shape[2]), this->_nclasses,
-                        inputc.width(), inputc.height());
+                        raw_out, batch_size, out_shape[1], out_shape[2],
+                        this->_nclasses, target_width, target_height);
                     yolo_ptr = yolo_out.data();
                   }
               }
@@ -1025,12 +1003,12 @@ namespace dd
 
                 if (this->_template == "yolox")
                   {
-                    int num_anchors = static_cast<int>(out_shape[1]);
+                    size_t num_anchors = out_shape[1];
                     if (yolo_ptr != nullptr)
                       {
                         const float *batch_yolo
                             = yolo_ptr + (b * num_anchors * 7);
-                        for (int d = 0; d < num_anchors; ++d)
+                        for (size_t d = 0; d < num_anchors; ++d)
                           {
                             const float *det = batch_yolo + (d * 7);
                             // Sorted by descending score in parse_yolo_output
@@ -1041,7 +1019,7 @@ namespace dd
                   }
                 else
                   {
-                    for (int d = 0; d < max_dets; ++d)
+                    for (size_t d = 0; d < max_dets; ++d)
                       {
                         if (!this->_need_nms && best_bbox > 0
                             && bboxes.size() >= static_cast<size_t>(best_bbox))

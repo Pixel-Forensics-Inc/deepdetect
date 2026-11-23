@@ -55,8 +55,6 @@ namespace dd
   public:
     // Model and image dimensions
     int _nclasses = 0;
-    int _width = 0;
-    int _height = 0;
     int _max_batch_size = 1;
 
     // Hardware and Execution Provider options

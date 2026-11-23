@@ -23,7 +23,6 @@
 #include <opencv2/core/core.hpp>
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/imgproc/imgproc.hpp>
-#include <boost/math/cstdfloat/cstdfloat_types.hpp>
 
 #ifdef USE_CUDA_CV
 #include <opencv2/core/cuda_stream_accessor.hpp>
@@ -46,59 +45,34 @@ namespace dd
           "std vector must match the number of channels ("
           + std::to_string(channels) + ")");
 
-    bool has_std = !_std.empty();
-    int offset = channels * _height * _width * i;
     img.convertTo(converted, CV_32F);
-    boost::float32_t *fbuf = (boost::float32_t *)(_buf.data());
-    boost::float32_t *cvbuf = (boost::float32_t *)converted.data;
-
-    // Convert interleaved HWC (OpenCV default) to planar CHW (ONNX / PyTorch
-    // standard)
+    size_t offset = size_t(i) * converted.total() * channels;
     for (int c = 0; c < channels; ++c)
-      for (int h = 0; h < _height; ++h)
-        for (int w = 0; w < _width; ++w)
-          {
-            fbuf[offset]
-                = _scale * cvbuf[(converted.cols * h + w) * channels + c];
-            ++offset;
-          }
-
-    // Apply channel-wise mean subtraction
-    if (_has_mean_scalar)
-      {
-        offset = channels * _height * _width * i;
-        for (int c = 0; c < channels; ++c)
-          for (int h = 0; h < _height; ++h)
-            for (int w = 0; w < _width; ++w)
-              {
-                fbuf[offset] -= _mean[c];
-                ++offset;
-              }
-      }
-
-    // Apply channel-wise std normalization
-    if (has_std)
-      {
-        offset = channels * _height * _width * i;
-        for (int c = 0; c < channels; ++c)
-          for (int h = 0; h < _height; ++h)
-            for (int w = 0; w < _width; ++w)
-              {
-                fbuf[offset] /= _std[c];
-                ++offset;
-              }
-      }
+      for (int h = 0; h < converted.rows; ++h)
+        {
+          const float *row = converted.ptr<float>(h);
+          for (int w = 0; w < converted.cols; ++w)
+            {
+              float value = _scale * row[size_t(w) * channels + c];
+              if (_has_mean_scalar)
+                value -= _mean[c];
+              if (!_std.empty())
+                value /= _std[c];
+              _buf[offset++] = value;
+            }
+        }
   }
 
 #ifdef USE_CUDA_CV
   void ImgONNXRuntimeInputFileConn::GpuMatToORTBuffer(cv::cuda::GpuMat &img,
-                                                      int i)
+                                                      int i,
+                                                      float *device_buffer)
   {
     int channels = img.channels();
     bool has_std = !_std.empty();
     cv::cuda::GpuMat converted;
 
-    if (_cuda_buf == nullptr)
+    if (device_buffer == nullptr)
       throw InputConnectorInternalException(
           "No cuda buffer available to copy the data");
 
@@ -129,10 +103,11 @@ namespace dd
           cv::cuda::multiply(channel, 1.0 / _std[c], channel, 1, -1,
                              *_cuda_stream);
 
-        int offset = _height * _width * (i * channels + c);
-        cudaMemcpy2DAsync(_cuda_buf + offset, _width * sizeof(float),
+        size_t offset
+            = size_t(img.rows) * img.cols * (size_t(i) * channels + c);
+        cudaMemcpy2DAsync(device_buffer + offset, img.cols * sizeof(float),
                           channel.ptr<float>(), channel.step,
-                          _width * sizeof(float), _height,
+                          img.cols * sizeof(float), img.rows,
                           cudaMemcpyDeviceToDevice,
                           cv::cuda::StreamAccessor::getStream(*_cuda_stream));
       }
@@ -172,55 +147,48 @@ namespace dd
     _batch_index = 0;
   }
 
-  int ImgONNXRuntimeInputFileConn::process_batch(const unsigned int batch_size)
+  std::array<int, 3>
+  ImgONNXRuntimeInputFileConn::batch_shape(int batch_size) const
   {
-    size_t img_count =
-#ifdef USE_CUDA_CV
-        _cuda ? this->_cuda_images.size() :
-#endif
-              this->_images.size();
-
-    if (img_count > batch_size)
-      {
-        this->_logger->warn("Batch size is larger than max_batch_size");
-      }
-
-    unsigned int i;
-    size_t image_elements = channels() * height() * width();
-    _buf.resize(batch_size * image_elements);
-    for (i = 0; i < batch_size && _batch_index < (int)img_count;
-         i++, _batch_index++)
+    auto shape_at = [&](int index) -> std::array<int, 3>
       {
 #ifdef USE_CUDA_CV
         if (_cuda)
           {
-            cv::cuda::GpuMat img = this->_cuda_images.at(_batch_index);
-            GpuMatToORTBuffer(img, i);
+            const auto &img = _cuda_images.at(index);
+            return { img.channels(), img.rows, img.cols };
           }
-        else
 #endif
-          {
-            cv::Mat img = this->_images.at(_batch_index);
-            CVMatToORTBuffer(img, i);
-          }
-      }
-    // Zero-pad the remaining uninitialized batch slots to prevent ghost
-    // inferences
-    if (i < batch_size)
-      {
-        std::fill(_buf.begin() + (i * image_elements), _buf.end(), 0.0f);
+        const auto &img = _images.at(index);
+        return { img.channels(), img.rows, img.cols };
+      };
+    const auto shape = shape_at(_batch_index);
+    if (shape[1] <= 0 || shape[2] <= 0)
+      throw InputConnectorBadParamException("Empty transformed input image");
+    for (int i = 1; i < batch_size; ++i)
+      if (shape_at(_batch_index + i) != shape)
+        throw InputConnectorBadParamException(
+            "Transformed images in a batch must have identical channels, "
+            "height and width");
+    return shape;
+  }
+
+  void ImgONNXRuntimeInputFileConn::process_batch(int batch_size,
+                                                  size_t elements,
+                                                  float *device_buffer)
+  {
 #ifdef USE_CUDA_CV
-        if (_cuda)
-          {
-            size_t empty_elements = (batch_size - i) * image_elements;
-            cudaMemsetAsync(
-                _cuda_buf + (i * image_elements), 0,
-                empty_elements * sizeof(float),
-                cv::cuda::StreamAccessor::getStream(*_cuda_stream));
-            _cuda_stream->waitForCompletion();
-          }
-#endif
+    if (_cuda)
+      {
+        for (int i = 0; i < batch_size; ++i)
+          GpuMatToORTBuffer(_cuda_images.at(_batch_index++), i, device_buffer);
+        return;
       }
-    return i;
+#else
+    (void)device_buffer;
+#endif
+    _buf.resize(elements);
+    for (int i = 0; i < batch_size; ++i)
+      CVMatToORTBuffer(_images.at(_batch_index++), i);
   }
 }
