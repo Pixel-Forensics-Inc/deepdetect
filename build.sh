@@ -333,8 +333,9 @@ gpu_build() {
             fi
             ;;
         "onnxruntime")
-                    extra_flags="-DUSE_ONNXRUNTIME=ON -DUSE_TORCH=OFF -DUSE_CUDA_CV=ON -DUSE_OPENCV_VERSION=4 -DOpenCV_DIR=${DEEPDETECT_OPENCV4_BUILD_PATH}"
-                    ;;
+            # The standalone GPU image uses the distribution OpenCV package.
+            extra_flags="-DUSE_ONNXRUNTIME=ON -DUSE_TORCH=OFF -DUSE_CUDA_CV=OFF -DUSE_OPENCV_VERSION=4 -DOpenCV_DIR=${DEEPDETECT_OPENCV4_BUILD_PATH}"
+            ;;
         "tensorrt_onnxruntime")
                     extra_flags="-DUSE_TENSORRT=ON -DUSE_ONNXRUNTIME=ON -DUSE_TORCH=OFF -DUSE_CUDA_CV=ON -DUSE_OPENCV_VERSION=4 -DOpenCV_DIR=${DEEPDETECT_OPENCV4_BUILD_PATH}"
                     if [ "${DEEPDETECT_TENSORRT_VERSION}" ] && [ "${DEEPDETECT_TENSORRT_VERSION}" != "null" ]; then
