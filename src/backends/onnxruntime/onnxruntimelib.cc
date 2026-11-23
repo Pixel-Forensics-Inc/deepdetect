@@ -810,6 +810,24 @@ namespace dd
                 "ONNX Runtime returned no output tensors");
           }
 
+        const size_t parsed_outputs
+            = extract_layer.empty() ? 1 : output_tensors.size();
+        for (size_t t = 0; t < parsed_outputs; ++t)
+          {
+            if (!output_tensors[t].IsTensor())
+              throw MLLibBadParamException("Expected an ONNX tensor output");
+            auto info = output_tensors[t].GetTensorTypeAndShapeInfo();
+            auto dims = info.GetShape();
+            if (dims.empty() || dims.front() != batch_size)
+              throw MLLibBadParamException(
+                  "ONNX output batch dimension must match the input batch");
+            if (extract_layer.empty()
+                && info.GetElementType()
+                       != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
+              throw MLLibBadParamException(
+                  "ONNX classification and detection outputs must be float32");
+          }
+
         // Handle extract_layer tensor extraction
         if (!extract_layer.empty())
           {
@@ -896,7 +914,7 @@ namespace dd
 
             std::vector<float> yolo_out;
             const float *yolo_ptr = nullptr;
-            int max_dets = 0;
+            size_t max_dets = 0;
 
             if (this->_template == "yolox")
               {
@@ -985,12 +1003,12 @@ namespace dd
 
                 if (this->_template == "yolox")
                   {
-                    int num_anchors = static_cast<int>(out_shape[1]);
+                    size_t num_anchors = out_shape[1];
                     if (yolo_ptr != nullptr)
                       {
                         const float *batch_yolo
                             = yolo_ptr + (b * num_anchors * 7);
-                        for (int d = 0; d < num_anchors; ++d)
+                        for (size_t d = 0; d < num_anchors; ++d)
                           {
                             const float *det = batch_yolo + (d * 7);
                             // Sorted by descending score in parse_yolo_output
@@ -1001,7 +1019,7 @@ namespace dd
                   }
                 else
                   {
-                    for (int d = 0; d < max_dets; ++d)
+                    for (size_t d = 0; d < max_dets; ++d)
                       {
                         if (!this->_need_nms && best_bbox > 0
                             && bboxes.size() >= static_cast<size_t>(best_bbox))
